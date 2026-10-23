@@ -1,0 +1,1 @@
+Executed 2026-10-23 with .NET SDK 10.0.402. MSTest integration tests: Passed 9, Failed 0, Skipped 0. Each test uses a fresh in-memory SQLite database. Command: dotnet test SafeVault.Api.Tests/SafeVault.Api.Tests.csproj --logger trx --results-directory ./TestResults

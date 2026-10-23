@@ -1,0 +1,690 @@
+Copilot navigation
+Quick links
+New chat
+Agents
+Spaces
+Chats
+Today
+ASP.NET Core SafeVault course demo improvements
+Collapse
+arnur-kozhabergen
+Copilot Free · Upgrade
+Condense sidebar
+ASP.NET Core SafeVault course demo improvements
+Share chat
+Copilot Chat
+ASP.NET Core SafeVault course demo improvements
+You said: I am finishing a local ASP.NET Core
+I am finishing a local ASP.NET Core SafeVault course demo. Please generate concise C# code and review guidance for (1) server-side validation of Title (1..100 after Trim) and Body (1..4000) without treating validation as SQL/XSS defense, (2) EF Core parameterized LINQ title search scoped to authenticated subject, (3) Identity/JWT role-based authorization: public registration only User, admin routes [Authorize(Roles="Admin")], (4) regression tests for SQL injection, stored XSS encoding, wrong-password lockout and invalid JWT. Existing code uses [ApiController], Required/StringLength request attributes; query.Where(r => r.Title == title), owner scope from JWT sub; HtmlEncoder.Default.Encode stored Title and Body; Identity password policy and 5-attempt 15-minute lockout; validated HS256 issuer/audience/expiry. Point out concrete weaknesses and provide a small bounded validation improvement and two meaningful MSTest/WebApplicationFactory regression tests. Do not claim you executed anything. No repository access is needed; this is non-sensitive original course code.
+Copilot said: Below is a compact, course-safe pattern for
+
+Below is a compact, course-safe pattern for the demo. This is intentionally minimal and bounded: it validates user input, scopes queries by the authenticated subject, and uses Identity/JWT role checks without pretending validation is a security boundary.
+
+Concrete weaknesses in the current pattern:
+
+StringLength alone does not trim whitespace before validating; "   " may pass if you only check Length, then later DB or UI sees a blank value.
+Validation is not a substitute for parameterized queries or output encoding. It is for input correctness only.
+Equality search on title with no caller-scope filter is a privacy bug; it must be constrained to the authenticated subject.
+JWT role validation should explicitly enforce Roles and valid alg/issuer/audience.
+Lockout and PasswordOptions are good, but only if Identity is actually configured with LockoutOnFailure: true on sign-in.
+Stored XSS defense belongs at render time (encoding) and in sanitization policy, not in title/body validation.
+Server-side validation: trim + bounded length, not SQL/XSS defense
+C#
+using System.ComponentModel.DataAnnotations;
+
+public sealed class CreateRecordRequest
+{
+    [Required]
+    public string? Title { get; set; }
+
+    [Required]
+    public string? Body { get; set; }
+
+    public (string Title, string Body) Normalized()
+        => (Title?.Trim() ?? string.Empty, Body?.Trim() ?? string.Empty);
+
+    public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+    {
+        var title = Title?.Trim();
+        var body = Body?.Trim();
+
+        if (string.IsNullOrWhiteSpace(title))
+            yield return new ValidationResult("Title is required.", new[] { nameof(Title) });
+        else if (title.Length < 1 || title.Length > 100)
+            yield return new ValidationResult("Title must be 1-100 characters after trimming.", new[] { nameof(Title) });
+
+        if (string.IsNullOrWhiteSpace(body))
+            yield return new ValidationResult("Body is required.", new[] { nameof(Body) });
+        else if (body.Length < 1 || body.Length > 4000)
+            yield return new ValidationResult("Body must be 1-4000 characters after trimming.", new[] { nameof(Body) });
+    }
+}
+
+
+Controller usage:
+
+C#
+using System.Text.Encodings.Web;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using System.Security.Claims;
+
+[ApiController]
+[Route("api/[controller]")]
+public sealed class VaultRecordsController : ControllerBase
+{
+    private readonly AppDbContext _db;
+
+    public VaultRecordsController(AppDbContext db)
+    {
+        _db = db;
+    }
+
+    [Authorize]
+    [HttpPost]
+    public async Task<IActionResult> Create([FromBody] CreateRecordRequest request)
+    {
+        if (!ModelState.IsValid)
+            return ValidationProblem(ModelState);
+
+        var title = request.Title!.Trim();
+        var body = request.Body!.Trim();
+
+        // This is not the SQL/XSS defense. It's just user-input validation.
+        var subject = User.FindFirstValue("sub")
+            ?? User.FindFirstValue(ClaimTypes.NameIdentifier);
+
+        if (string.IsNullOrWhiteSpace(subject))
+            return Unauthorized();
+
+        var entity = new VaultRecord
+        {
+            Title = title,
+            Body = body,
+            OwnerSubject = subject,
+            CreatedUtc = DateTime.UtcNow
+        };
+
+        _db.VaultRecords.Add(entity);
+        await _db.SaveChangesAsync();
+
+        return Ok(new
+        {
+            // encode output once rendered; do not assume raw DB string is safe
+            title = HtmlEncoder.Default.Encode(entity.Title),
+            body = HtmlEncoder.Default.Encode(entity.Body)
+        });
+    }
+}
+
+EF Core parameterized LINQ title search scoped to authenticated subject
+C#
+using Microsoft.EntityFrameworkCore;
+using System.Security.Claims;
+
+[Authorize]
+[HttpGet("search")]
+public async Task<IActionResult> Search([FromQuery] string title)
+{
+    if (string.IsNullOrWhiteSpace(title))
+        return BadRequest("Title is required.");
+
+    var normalized = title.Trim();
+    if (normalized.Length > 100)
+        return BadRequest("Title must be 1-100 characters after trimming.");
+
+    var subject = User.FindFirstValue("sub")
+        ?? User.FindFirstValue(ClaimTypes.NameIdentifier);
+
+    if (string.IsNullOrWhiteSpace(subject))
+        return Unauthorized();
+
+    // LINQ generates parameterized SQL; no raw SQL, no string concatenation.
+    var results = await _db.VaultRecords
+        .AsNoTracking()
+        .Where(r => r.OwnerSubject == subject && r.Title == normalized)
+        .Select(r => new
+        {
+            r.Id,
+            Title = HtmlEncoder.Default.Encode(r.Title),
+            Body = HtmlEncoder.Default.Encode(r.Body)
+        })
+        .ToListAsync();
+
+    return Ok(results);
+}
+
+
+This is the key point: LINQ to EF Core is parameterized by the provider; raw SQL concatenation is the dangerous part.
+
+Identity + JWT: public registration only User; admin routes require Admin
+
+Identity setup:
+
+C#
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
+using System.Text;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services
+    .AddDbContext<AppDbContext>(options => options.UseSqlServer(builder.Configuration.GetConnectionString("Default")));
+
+builder.Services
+    .AddIdentity<ApplicationUser, IdentityRole>(options =>
+    {
+        options.Password.RequiredLength = 8;
+        options.Password.RequireDigit = true;
+        options.Password.RequireUppercase = true;
+        options.Password.RequireLowercase = true;
+        options.Password.RequireNonAlphanumeric = false;
+
+        options.Lockout.DefaultLockoutTimeSpan = TimeSpan.FromMinutes(15);
+        options.Lockout.MaxFailedAccessAttempts = 5;
+        options.Lockout.AllowedForNewUsers = true;
+    })
+    .AddEntityFrameworkStores<AppDbContext>()
+    .AddDefaultTokenProviders();
+
+builder.Services
+    .AddAuthentication(options =>
+    {
+        options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+        options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+    })
+    .AddJwtBearer(options =>
+    {
+        var key = Encoding.UTF8.GetBytes(builder.Configuration["Jwt:Key"]!);
+
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidIssuer = builder.Configuration["Jwt:Issuer"],
+            ValidateAudience = true,
+            ValidAudience = builder.Configuration["Jwt:Audience"],
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(key),
+            ValidateLifetime = true,
+            ClockSkew = TimeSpan.FromMinutes(1),
+            RequireExpirationTime = true,
+            ValidAlgorithms = new[] { SecurityAlgorithms.HmacSha256 }
+        };
+    });
+
+builder.Services.AddAuthorization();
+
+var app = builder.Build();
+
+app.UseAuthentication();
+app.UseAuthorization();
+
+
+Public registration endpoint (only User role):
+
+C#
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+
+[ApiController]
+[Route("api/[controller]")]
+public sealed class AccountController : ControllerBase
+{
+    private readonly UserManager<ApplicationUser> _userManager;
+    private readonly RoleManager<IdentityRole> _roleManager;
+
+    public AccountController(UserManager<ApplicationUser> userManager, RoleManager<IdentityRole> roleManager)
+    {
+        _userManager = userManager;
+        _roleManager = roleManager;
+    }
+
+    [AllowAnonymous]
+    [HttpPost("register")]
+    public async Task<IActionResult> Register([FromBody] RegisterRequest dto)
+    {
+        if (!ModelState.IsValid)
+            return ValidationProblem(ModelState);
+
+        var user = new ApplicationUser
+        {
+            UserName = dto.Email,
+            Email = dto.Email
+        };
+
+        var result = await _userManager.CreateAsync(user, dto.Password);
+        if (!result.Succeeded)
+            return BadRequest(result.Errors);
+
+        // Seed these roles at startup or app boot.
+        if (!await _roleManager.RoleExistsAsync("User"))
+            await _roleManager.CreateAsync(new IdentityRole("User"));
+
+        if (!await _roleManager.RoleExistsAsync("Admin"))
+            await _roleManager.CreateAsync(new IdentityRole("Admin"));
+
+        await _userManager.AddToRoleAsync(user, "User");
+        return Ok(new { user.Id, user.Email });
+    }
+
+    [Authorize(Roles = "Admin")]
+    [HttpGet("admin-only")]
+    public IActionResult AdminOnly()
+    {
+        return Ok(new { message = "Admin route" });
+    }
+}
+
+Regression tests: two meaningful MSTest/WebApplicationFactory checks
+
+Use a real WebApplicationFactory<Program> and a seeded user/admin for these tests.
+
+Test 1: SQL injection and stored XSS encoding
+
+POST a record with Title = "x' OR '1'='1" and Body = "<script>alert(1)</script>"
+Assert the record is created, the stored response returns encoded HTML (&lt;script&gt;...), and a title search using a malicious payload does not match anything.
+This guards both injection and encoding.
+C#
+using System.Net;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Text.Encodings.Web;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+
+[TestClass]
+public class SecurityRegressionTests
+{
+    [TestMethod]
+    public async Task SearchAndStore_RejectsSqlInjectionAndEncodesStoredOutput()
+    {
+        await using var factory = new WebApplicationFactory<Program>();
+        using var client = factory.CreateClient();
+
+        // Arrange: login as an authenticated user
+        var login = await client.PostAsJsonAsync("/api/account/login", new
+        {
+            email = "alice@example.com",
+            password = "Password123!"
+        });
+
+        Assert.AreEqual(HttpStatusCode.OK, login.StatusCode);
+        var token = await login.Content.ReadAsStringAsync(); // or parse JWT from JSON
+
+        client.DefaultRequestHeaders.Authorization =
+            new AuthenticationHeaderValue("Bearer", token);
+
+        var badTitle = "x' OR '1'='1";
+        var badBody = "<script>alert(1)</script>hello";
+
+        // Act: create record with malicious input
+        var create = await client.PostAsJsonAsync("/api/vaultrecords", new
+        {
+            title = badTitle,
+            body = badBody
+        });
+        Assert.AreEqual(HttpStatusCode.OK, create.StatusCode);
+
+        var created = await create.Content.ReadFromJsonAsync<Dictionary<string, string>>();
+        Assert.IsNotNull(created);
+        Assert.AreEqual(HtmlEncoder.Default.Encode(badBody), created["body"]);
+        Assert.IsTrue(created["body"].Contains("&lt;script&gt;"));
+
+        // Search with injection payload must be treated as a literal title, not SQL
+        var search = await client.GetAsync($"/api/vaultrecords/search?title={Uri.EscapeDataString("x' OR '1'='1")}");
+        Assert.AreEqual(HttpStatusCode.OK, search.StatusCode);
+
+        var results = await search.Content.ReadFromJsonAsync<List<Dictionary<string, string>>>();
+        Assert.IsNotNull(results);
+        Assert.AreEqual(0, results.Count);
+    }
+}
+
+
+Test 2: invalid JWT and lockout
+
+Invalid bearer token should be rejected with 401.
+Wrong-password attempts should hit lockout after 5 failures.
+This covers both invalid JWT and brute-force lockout.
+C#
+using System.Net;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+
+[TestClass]
+public class AuthRegressionTests
+{
+    [TestMethod]
+    public async Task InvalidJwt_AndTooManyFailedLogins_AreRejected()
+    {
+        await using var factory = new WebApplicationFactory<Program>();
+        using var client = factory.CreateClient();
+
+        // invalid JWT
+        client.DefaultRequestHeaders.Authorization =
+            new AuthenticationHeaderValue("Bearer", "not-a-real.jwt.token");
+
+        var adminCall = await client.GetAsync("/api/account/admin-only");
+        Assert.AreEqual(HttpStatusCode.Unauthorized, adminCall.StatusCode);
+
+        // wrong-password lockout: 5 failed attempts before lockout
+        client.DefaultRequestHeaders.Authorization = null;
+
+        for (var i = 0; i < 5; i++)
+        {
+            var failed = await client.PostAsJsonAsync("/api/account/login", new
+            {
+                email = "admin@example.com",
+                password = "WrongPassword123!"
+            });
+
+            if (i < 4)
+                Assert.AreEqual(HttpStatusCode.Unauthorized, failed.StatusCode);
+        }
+
+        var locked = await client.PostAsJsonAsync("/api/account/login", new
+        {
+            email = "admin@example.com",
+            password = "WrongPassword123!"
+        });
+
+        Assert.AreEqual(HttpStatusCode.Locked, locked.StatusCode);
+    }
+}
+
+
+If you want the smallest practical improvement for the current course demo:
+
+Add the custom trim+length validation on the request DTO.
+Add OwnerSubject to the record and compare against the JWT sub/NameIdentifier in every query.
+Ensure LockoutOnFailure: true is set in Identity.
+Ensure JWT validation includes ValidAlgorithms, ValidateIssuer, ValidateAudience, ValidateLifetime, and IssuerSigningKey.
+Keep raw DB fields as plain strings and encode at render time; do not treat validation as a sanitizer.
+
+If you want, I can turn this into a single “drop-in” ASP.NET Core controller + DTO + Program.cs snippet for the exact demo structure you’re using.
+
+You said: I actually executed the local integration suite.
+I actually executed the local integration suite. It initially failed to compile ValidationProblem(errors Dictionary<string,string[]>), fixed to ValidationProblem(new ValidationProblemDetails(errors)); added missing using Microsoft.AspNetCore.TestHost. Program read Jwt:SigningKey before WebApplicationFactory configuration hooks; moved its validation inside AddJwtBearer callback and force-resolved IOptionsMonitor<JwtBearerOptions> after app.Build, keeping startup fail-closed. Record constructor validation needed parameter attributes rather than [property:Required]. Now 3/5 tests pass, two searches fail because SQLite cannot ORDER BY DateTimeOffset CreatedUtc. Generate the precise EF model configuration conversion to UTC ticks (preserve UTC ordering) and a correct auth/RBAC regression improvement using our routes /api/auth/register and /api/auth/login with JSON {AccessToken,TokenType,ExpiresAtUtc}, regular /api/records and admin /api/admin/records. Actual login returns 401 for wrong password AND locked account (generic message); so do not expect 423. Add test proving 5 wrong passwords cause subsequent CORRECT password rejection, plus forged/invalid JWT401. Public register DTO has Email,Password only. Please also verify safe handling of role-claim injection and how to test it. Do not claim execution.
+Copilot said: I have not executed anything; this is
+
+I have not executed anything; this is the corrected pattern for your local suite based on your described fixes and failures.
+
+Bounded validation: trim first, validate after trim, not as SQL/XSS defense
+
+Use IValidatableObject or manual trim + validation in the endpoint. The key is: validation is for correctness, not for sanitization.
+
+CreateRecordRequest.cs
+using System.ComponentModel.DataAnnotations;
+
+public sealed class CreateRecordRequest : IValidatableObject
+{
+    public string? Title { get; set; }
+    public string? Body { get; set; }
+
+
+Controller pattern:
+
+RecordsController.cs
+using System.Security.Claims;
+using System.Text.Encodings.Web;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+
+
+EF Core ordering bug: convert DateTimeOffset to UTC ticks for SQLite ordering
+
+Your issue is exactly the SQLite limitation: ORDER BY on DateTimeOffset is not supported consistently. Convert to a numeric UTC tick column for ordering while preserving the date/time semantics.
+
+Use a long-backed value in the database and convert it at model boundary:
+
+Record.cs
+public sealed class Record
+{
+    public int Id { get; set; }
+    public string Title { get; set; } = string.Empty;
+    public string Body { get; set; } = string.Empty;
+    public string OwnerSubject { get; set; } = string.Empty;
+
+AppDbContext.cs
+using Microsoft.EntityFrameworkCore;
+
+public sealed class AppDbContext : DbContext
+{
+    public DbSet<Record> Records => Set<Record>();
+
+
+
+This preserves UTC ordering because SQLite orders integer ticks. The CLR model remains DateTimeOffset; the database stores INTEGER ticks. That avoids ORDER BY DateTimeOffset SQL generation in SQLite.
+
+Auth/RBAC: public register only User, admin route requires Admin
+
+Use the route names you described: /api/auth/register, /api/auth/login, /api/records, /api/admin/records.
+
+Public registration only creates a User role:
+
+AuthController.cs
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+
+
+Admin route:
+
+AdminRecordsController.cs
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+
+[ApiController]
+[Route("api/admin")]
+public sealed class AdminRecordsController : ControllerBase
+
+
+Important: your JWT validation must be fail-closed and must validate issuer/audience + signing key + expiry + algorithm. Example:
+
+Program.cs
+v1
+using System.Text;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
+
+var builder = WebApplication.CreateBuilder(args);
+
+
+
+Also avoid reading Jwt:SigningKey before configuration hooks; that was the compile/startup issue you saw. Keep the validation inside the AddJwtBearer callback or in a startup validator, then fail closed.
+
+Correct regression tests for invalid JWT and lockout
+
+Use WebApplicationFactory<Program> and TestServer/HttpClient. Keep the test expectations realistic: wrong password and locked account both respond 401, not 423.
+
+Test 1: five wrong passwords cause later correct password rejection (generic 401)
+
+AuthLockoutRegressionTests.cs
+using System.Net;
+using System.Net.Http.Json;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+
+[TestClass]
+
+
+This matches your actual behavior: a wrong password and a locked account both return a generic 401.
+
+Test 2: forged or invalid JWT rejected
+
+JwtSecurityRegressionTests.cs
+using System.Net;
+using System.Net.Http.Headers;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+
+[TestClass]
+
+Safe handling of role-claim injection and how to test it
+
+This is the main security check: do not trust raw incoming role claims as the only source of authority. Use the server-issued role membership after validating the token signature and issuer/audience.
+
+Safe pattern:
+
+Validate JWT completely first (signature, issuer, audience, expiry, alg).
+Use the sub claim to look up the user.
+Load actual roles from the Identity store or role claims persisted on the server.
+Only then authorize.
+
+Unsafe pattern:
+
+Trusting any role claim in an incoming JWT without checking user role membership.
+
+Example safe pattern for the admin route:
+
+AdminRoleGuard.cs
+using System.Security.Claims;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+
+public sealed class AdminRoleRequirement : IAuthorizationRequirement { }
+
+
+
+and then register:
+
+Program.cs
+v2
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("RequireAdmin", policy =>
+        policy.RequireRole("Admin"));
+});
+
+
+
+How to test role-claim injection safely:
+
+Create a user with no Admin role.
+Create a JWT carrying role=Admin but signed with an invalid key or with a mismatched issuer/audience.
+Expect 401.
+Create a JWT carrying role=Admin signed correctly, but the user still has no Admin role in Identity.
+Expect 403/401 depending your endpoint config and auth setup.
+Create a valid admin user token and expect 200.
+
+Example test:
+
+RoleClaimInjectionRegressionTest.cs
+using System.IdentityModel.Tokens.Jwt;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Security.Claims;
+using System.Text;
+using Microsoft.AspNetCore.Mvc.Testing;
+
+
+If the app uses Identity roles loaded from the server and the token is valid but the user is not actually in Admin, this fails closed.
+
+Practical review guidance
+Keep validation bounded and explicit:
+Title: trim, then require length 1..100
+Body: trim, then require length 1..4000
+Keep validation for user correctness; do not rely on it for SQL/XSS safety.
+Keep LINQ parameterized and scope to OwnerSubject.
+Keep LockoutOnFailure: true and DefaultLockoutTimeSpan = 15m and MaxFailedAccessAttempts = 5.
+Keep the login response generic: 401 for wrong password and locked account.
+Keep JWT fail-closed: validate signing key, issuer, audience, lifetime, algorithm.
+For SQLite, convert DateTimeOffset to UTC ticks before ordering.
+For admin authorization, base it on server-side role membership, not untrusted incoming claims.
+
+If you want, I can turn this into a single drop-in “course demo” version with:
+
+AppUser, RegisterRequest, LoginRequest
+Program.cs
+AppDbContext
+AuthController
+RecordsController
+AdminRecordsController
+factory-based tests for the exact route names you’re using.
+Model:
+Auto
+Optimized for: Balance
+Workbench
+Press Delete to close the focussed tab.
+CreateRecordRequest.cs
+RecordsController.cs
+Record.cs
+AppDbContext.cs
+AuthController.cs
+AdminRecordsController.cs
+Program.cs
+AuthLockoutRegressionTests.cs
+JwtSecurityRegressionTests.cs
+AdminRoleGuard.cs
+RoleClaimInjectionRegressionTest.cs
+
+26 lines · 1 KB
+
+CreateRecordRequest.cs file contents
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+ 10
+ 11
+ 12
+ 13
+ 14
+ 15
+ 16
+ 17
+ 18
+ 19
+ 20
+ 21
+ 22
+ 23
+ 24
+ 25
+ 26
+using System.ComponentModel.DataAnnotations;
+
+
+public sealed class CreateRecordRequest : IValidatableObject
+{
+    public string? Title { get; set; }
+    public string? Body { get; set; }
+
+
+    public (string Title, string Body) Normalized()
+        => (Title?.Trim() ?? string.Empty, Body?.Trim() ?? string.Empty);
+
+
+    public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+    {
+        var title = Title?.Trim();
+        var body = Body?.Trim();
+
+
+        if (string.IsNullOrWhiteSpace(title))
+            yield return new ValidationResult("Title is required.", new[] { nameof(Title) });
+        else if (title.Length > 100)
+            yield return new ValidationResult("Title must be 1-100 characters after trimming.", new[] { nameof(Title) });
+
+
+        if (string.IsNullOrWhiteSpace(body))
+            yield return new ValidationResult("Body is required.", new[] { nameof(Body) });
+        else if (body.Length > 4000)
+            yield return new ValidationResult("Body must be 1-4000 characters after trimming.", new[] { nameof(Body) });
+    }
+}
+Use Control + Shift + m to toggle the tab key moving focus. Alternatively, use esc then tab to move to the next interactive element on the page.
